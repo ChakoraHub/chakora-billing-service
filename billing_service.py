@@ -3,24 +3,7 @@
 # Port : 8010
 # Run  : uvicorn billing_service:app --host 0.0.0.0 --port 8010
 #
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Redis caching strategy (billing-specific)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  DB 5  (API response cache — shared via redis_service)
-#
-#  CACHED (short TTL):
-#    invoice:{transaction_id}        5 min   — lightweight read helper
-#    payment_status:{transaction_id} 3 min   — short; DB is authoritative
-#    billing:history:{phone}         5 min   — evicted on every write
-#    user:phone:{phone}             30 min   — stable lookup, saves an Oracle round-trip
-#    courses:all                    15 min   — rarely changes
-#
-#  NOT CACHED (by design):
-#    ✗  presigned S3 URLs          — contain credentials, must be freshly generated
-#    ✗  auth password hashes       — security risk; always verify against DB
-#    ✗  payment state blindly      — DB is always the authoritative source
-#    ✗  billing:history long-TTL   — stale after every create/approve
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Cache and stream acceleration are disabled in this build.
 
 import os
 import base64
@@ -33,7 +16,6 @@ import hmac
 import hashlib
 import pathlib
 import boto3
-import redis
 import threading
 import time
 import traceback
@@ -83,30 +65,8 @@ load_dotenv(dotenv_path=_SERVICE_ENV_PATH, override=False)
 _SERVICE_ENV = dotenv_values(_SERVICE_ENV_PATH) if _SERVICE_ENV_PATH.exists() else {}
 
 # =====================================================
-# REDIS CONFIGURATION
-# All billing cache lives in DB 5 (API response cache)
-# to stay consistent with redis_service.py's DB layout.
+# Caching and stream tooling are intentionally disabled.
 # =====================================================
-_REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-_REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-_REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
-_REDIS_DB_BILLING = 0          # DB 5 — shared API response cache
-
-# Connection pool — used only by billing-internal helpers that
-# cannot route through redis_service (stream consumer, idempotency key).
-# All standard cache reads/writes also go through this pool so that
-# billing_service can run standalone without redis_service.
-_redis_pool = redis.ConnectionPool(
-    host=_REDIS_HOST,
-    port=_REDIS_PORT,
-    password=_REDIS_PASSWORD,
-    db=_REDIS_DB_BILLING,
-    decode_responses=True,
-    max_connections=20,
-    socket_timeout=8,
-    socket_connect_timeout=3,
-)
-redis_client = redis.Redis(connection_pool=_redis_pool)
 
 # Kafka Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -286,64 +246,31 @@ except Exception as _se:
     print(f"⚠️  SES unavailable: {_se}")
 
 # =====================================================
-# REDIS CACHE HELPERS  (billing namespace, DB 5)
+# Cache helper stubs (cache disabled)
 # =====================================================
 def cache_get(key: str):
-    """Return deserialized value or None on miss / error."""
-    try:
-        raw = redis_client.get(key)
-        return json.loads(raw) if raw is not None else None
-    except Exception as exc:
-        print(f"⚠️  Redis GET error [{key}]: {exc}")
-        return None
+    _ = key
+    return None
 
 
 def cache_set(key: str, value: Any, ttl: int) -> bool:
-    """Serialize and store value with explicit TTL. Always pass TTL — never omit it."""
-    try:
-        redis_client.setex(key, ttl, json.dumps(value, default=str))
-        return True
-    except Exception as exc:
-        print(f"⚠️  Redis SET error [{key}]: {exc}")
-        return False
+    _ = (key, value, ttl)
+    return True
 
 
 def cache_delete(key: str) -> bool:
-    try:
-        redis_client.delete(key)
-        return True
-    except Exception as exc:
-        print(f"⚠️  Redis DELETE error [{key}]: {exc}")
-        return False
+    _ = key
+    return True
 
 
 def cache_delete_pattern(pattern: str) -> bool:
-    """
-    Use SCAN instead of KEYS to avoid blocking large Redis instances.
-    Scoped to billing namespace patterns only — never flushes other services.
-    """
-    try:
-        pipe = redis_client.pipeline()
-        for key in redis_client.scan_iter(pattern, count=100):
-            pipe.delete(key)
-        pipe.execute()
-        return True
-    except Exception as exc:
-        print(f"⚠️  Redis DELETE PATTERN error [{pattern}]: {exc}")
-        return False
+    _ = pattern
+    return True
 
 
 def increment_counter(key: str, ttl: int = 86400):
-    """Atomic increment with expiry — used for counters/rate limiting."""
-    try:
-        pipe = redis_client.pipeline()
-        pipe.incr(key)
-        pipe.expire(key, ttl)
-        result = pipe.execute()
-        return result[0]
-    except Exception as exc:
-        print(f"⚠️  Redis INCR error [{key}]: {exc}")
-        return None
+    _ = (key, ttl)
+    return 1
 
 # =====================================================
 # BASIC AUTH
@@ -649,25 +576,7 @@ def _process_registration_event(event_id: str, event_fields: Dict[str, Any]) -> 
         print(f"⚠️  Skipping invalid registration event {event_id}: missing registration_id/user_id")
         return
 
-    # Idempotency — store in DB 0 (sessions DB) to survive service restarts
-    # We use the stream consumer's own Redis pool (DB 5 is billing-only).
-    # The idempotency key uses a separate Redis connection on DB 0.
-    idempotency_pool = redis.ConnectionPool(
-        host=_REDIS_HOST, port=_REDIS_PORT, password=_REDIS_PASSWORD,
-        db=0, decode_responses=True, socket_timeout=8, socket_connect_timeout=3,
-    )
-    idempotency_client = redis.Redis(connection_pool=idempotency_pool)
-    idempotency_key    = f"billing:stream:processed:{registration_id}"
-
-    try:
-        was_set = idempotency_client.set(idempotency_key, event_id, nx=True, ex=7 * 24 * 3600)
-    except Exception as exc:
-        print(f"⚠️  Could not set idempotency key for {registration_id}: {exc}")
-        was_set = True
-
-    if not was_set:
-        print(f"ℹ️  Duplicate registration event skipped for {registration_id}")
-        return
+    # Redis-based stream idempotency is disabled.
 
     conn = get_db_connection()
     if not conn:
@@ -700,21 +609,6 @@ def _process_registration_event(event_id: str, event_fields: Dict[str, Any]) -> 
             conn.commit()
             print(f"✅ Billing consumer inserted NRM_PAYMENTS for registration_id={registration_id}")
 
-            # Evict the student's dashboard cache so the next page-load
-            # re-runs the stored proc and reflects the new payment + enrolment.
-            try:
-                # Dashboard cache lives in DB 5 under redis_service's apicache namespace
-                dashboard_key = f"student:dashboard:{user_id}"
-                redis_client.delete(dashboard_key)
-                print(f"🗑️  {dashboard_key} dashboard cache evicted after registration")
-            except Exception as cache_exc:
-                print(f"⚠️  Could not evict dashboard cache for user {user_id}: {cache_exc}")
-
-            # Also evict any billing history cache for this user if phone is known
-            if student_email:
-                # We don't have phone here but evict by user_id pattern as best-effort
-                cache_delete_pattern(f"billing:history:*")
-
         else:
             print(f"ℹ️  NRM_PAYMENTS already exists for registration_id={registration_id}")
 
@@ -732,58 +626,14 @@ def _process_registration_event(event_id: str, event_fields: Dict[str, Any]) -> 
 
 
 def _registration_consumer_loop() -> None:
-    print(
-        f"✅ Registration consumer started: stream={REGISTRATION_STREAM_NAME}, "
-        f"group={REGISTRATION_CONSUMER_GROUP}, consumer={REGISTRATION_CONSUMER_NAME}"
-    )
-    while not _registration_consumer_stop.is_set():
-        try:
-            messages = redis_client.xreadgroup(
-                groupname=REGISTRATION_CONSUMER_GROUP,
-                consumername=REGISTRATION_CONSUMER_NAME,
-                streams={REGISTRATION_STREAM_NAME: ">"},
-                count=10,
-                block=5000,
-            )
-            if not messages:
-                continue
-            for stream_name, stream_messages in messages:
-                for event_id, fields in stream_messages:
-                    try:
-                        _process_registration_event(event_id, fields)
-                        redis_client.xack(stream_name, REGISTRATION_CONSUMER_GROUP, event_id)
-                    except Exception as exc:
-                        print(f"❌ Registration event processing failed for {event_id}: {exc}")
-        except redis.exceptions.TimeoutError:
-            # xreadgroup uses BLOCK; transient socket read timeouts are expected with idle streams.
-            continue
-        except Exception as exc:
-            print(f"❌ Registration consumer loop error: {exc}")
-            time.sleep(2)
+    print("ℹ️ Registration consumer disabled (cache/stream layer decoupled)")
+    return
 
 
 @app.on_event("startup")
 def start_registration_consumer() -> None:
-    global _registration_consumer_thread
-    try:
-        redis_client.xgroup_create(
-            name=REGISTRATION_STREAM_NAME,
-            groupname=REGISTRATION_CONSUMER_GROUP,
-            id="0",
-            mkstream=True,
-        )
-        print(f"✅ Redis stream group ready: {REGISTRATION_STREAM_NAME}/{REGISTRATION_CONSUMER_GROUP}")
-    except redis.exceptions.ResponseError as exc:
-        if "BUSYGROUP" not in str(exc):
-            print(f"❌ Failed to create stream group: {exc}")
-
-    _registration_consumer_stop.clear()
-    _registration_consumer_thread = threading.Thread(
-        target=_registration_consumer_loop,
-        name="registration-stream-consumer",
-        daemon=True,
-    )
-    _registration_consumer_thread.start()
+    print("ℹ️ Registration stream startup skipped (decoupled)")
+    return
 
 def start_kafka_consumer():
     if consumer is None:
@@ -2343,27 +2193,6 @@ async def clear_cache(pattern: Optional[str] = None, user=Depends(get_current_us
 
 
 # =====================================================
-# REDIS STATS
-# =====================================================
-@app.get("/redis-stats")
-async def redis_stats(user=Depends(get_current_user)):
-    try:
-        info  = redis_client.info()
-        hits  = info.get("keyspace_hits", 0)
-        total = hits + info.get("keyspace_misses", 1)
-        return {
-            "connected":         True,
-            "db":                _REDIS_DB_BILLING,
-            "used_memory":       info.get("used_memory_human"),
-            "total_keys":        redis_client.dbsize(),
-            "connected_clients": info.get("connected_clients"),
-            "uptime_days":       info.get("uptime_in_days"),
-            "hit_rate":          round(hits / total, 4),
-        }
-    except Exception as exc:
-        return {"connected": False, "error": str(exc)}
-
-# =====================================================
 # PDF INVOICE GENERATOR
 # =====================================================
 def _generate_invoice_pdf(
@@ -3248,16 +3077,10 @@ def health_check():
     db_status = "connected" if conn else "disconnected"
     if conn:
         conn.close()
-    try:
-        redis_client.ping()
-        redis_status = "connected"
-    except Exception:
-        redis_status = "disconnected"
     return {
         "status":    "healthy",
         "database":  db_status,
-        "redis":     redis_status,
-        "redis_db":  _REDIS_DB_BILLING,
+        "cache":     "disabled",
         "timestamp": datetime.now().isoformat(),
     }
 
@@ -3279,7 +3102,6 @@ async def test_billing():
             "approve":        "/billing-approve (PUT)",
             "my_billings":    "/billing-mybillings (GET)",
             "clear_cache":    "/clear-cache (POST — admin)",
-            "redis_stats":    "/redis-stats (GET)",
             "health":         "/health (GET)",
             "test":           "/billing-test (GET)",
         },
