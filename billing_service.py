@@ -550,19 +550,8 @@ def send_registration_completion_email(student_name, student_email, registration
 # =====================================================
 # REGISTRATION STREAM CONSUMER
 # =====================================================
-def _decode_stream_fields(raw_fields: Dict[str, Any]) -> Dict[str, Any]:
-    decoded = {}
-    for key, value in (raw_fields or {}).items():
-        try:
-            decoded[key] = json.loads(value)
-        except Exception:
-            decoded[key] = value
-    return decoded
-
-
-def _process_registration_event(event_id: str, event_fields: Dict[str, Any]) -> None:
-    """Step B + Step C merged: billing write + email in one consumer."""
-    payload         = _decode_stream_fields(event_fields)
+def _process_registration_event(payload: Dict[str, Any]) -> None:
+    """Persist payment info and send registration email from registration event."""
     registration_id = str(payload.get("registration_id") or "").strip()
     user_id         = int(payload.get("user_id") or 0)
     payment_id      = str(payload.get("payment_id") or "").strip()
@@ -573,7 +562,7 @@ def _process_registration_event(event_id: str, event_fields: Dict[str, Any]) -> 
     student_email   = str(payload.get("student_email") or "").strip()
 
     if not registration_id or not user_id:
-        print(f"⚠️  Skipping invalid registration event {event_id}: missing registration_id/user_id")
+        print(f"⚠️  Skipping invalid registration event: missing registration_id/user_id | payload={payload}")
         return
 
     # Redis-based stream idempotency is disabled.
@@ -626,14 +615,38 @@ def _process_registration_event(event_id: str, event_fields: Dict[str, Any]) -> 
 
 
 def _registration_consumer_loop() -> None:
-    print("ℹ️ Registration consumer disabled (cache/stream layer decoupled)")
-    return
+    consumer = None
+    try:
+        consumer = KafkaConsumer(
+            "registration.completed",
+            bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
+            group_id="billing-registration-completed-consumer",
+            auto_offset_reset="earliest",
+            enable_auto_commit=True,
+            value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+        )
+        print("✅ Billing registration.completed consumer connected")
+    except Exception as e:
+        print(f"⚠️  Billing registration.completed consumer unavailable @ {KAFKA_BOOTSTRAP_SERVERS}: {e}")
+        return
+
+    for msg in consumer:
+        payload = msg.value or {}
+        print(
+            f"📥 registration.completed received | "
+            f"partition={msg.partition} offset={msg.offset} reg_id={payload.get('registration_id')}"
+        )
+        try:
+            _process_registration_event(payload)
+        except Exception as e:
+            print(f"❌ registration.completed processing failed: {e}")
 
 
 @app.on_event("startup")
 def start_registration_consumer() -> None:
-    print("ℹ️ Registration stream startup skipped (decoupled)")
-    return
+    thread = threading.Thread(target=_registration_consumer_loop, daemon=True)
+    thread.start()
+    print("✅ registration.completed consumer thread started")
 
 def start_kafka_consumer():
     if consumer is None:
